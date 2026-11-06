@@ -15,25 +15,47 @@ import (
 )
 
 func newOffCommand() *cobra.Command {
-	return &cobra.Command{
+	var dryRun bool
+
+	cmd := &cobra.Command{
 		Use:   "off <namespace> <deployment>",
 		Short: "Scale a toggleable Deployment to zero",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runScaleCommand(cmd, args[0], args[1], false)
+			return runScaleCommand(cmd, args[0], args[1], false, dryRun)
 		},
 	}
+
+	cmd.Flags().BoolVar(
+		&dryRun,
+		"dry-run",
+		false,
+		"Preview the scaling operation without changing the cluster",
+	)
+
+	return cmd
 }
 
 func newOnCommand() *cobra.Command {
-	return &cobra.Command{
+	var dryRun bool
+
+	cmd := &cobra.Command{
 		Use:   "on <namespace> <deployment>",
 		Short: "Restore a toggleable Deployment",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runScaleCommand(cmd, args[0], args[1], true)
+			return runScaleCommand(cmd, args[0], args[1], true, dryRun)
 		},
 	}
+
+	cmd.Flags().BoolVar(
+		&dryRun,
+		"dry-run",
+		false,
+		"Preview the scaling operation without changing the cluster",
+	)
+
+	return cmd
 }
 
 func runScaleCommand(
@@ -41,6 +63,7 @@ func runScaleCommand(
 	namespace string,
 	name string,
 	enable bool,
+	dryRun bool,
 ) error {
 	client, err := kubernetes.NewClientset()
 	if err != nil {
@@ -49,6 +72,21 @@ func runScaleCommand(
 
 	manager := scale.NewManager(client)
 	ctx := cmd.Context()
+
+	if dryRun {
+		plan, err := manager.Preview(ctx, namespace, name, enable)
+		if err != nil {
+			return err
+		}
+
+		if !enable {
+			if err := warnAboutPVCs(cmd, client, namespace, name); err != nil {
+				return err
+			}
+		}
+
+		return printPlan(cmd, plan)
+	}
 
 	if enable {
 		if err := manager.On(ctx, namespace, name); err != nil {
@@ -113,6 +151,39 @@ func warnAboutPVCs(
 		cmd.OutOrStdout(),
 		"Scaling to zero stops its Pods. PVCs and PVs will not be deleted.",
 	)
+
+	return nil
+}
+
+func printPlan(cmd *cobra.Command, plan *scale.Plan) error {
+	action := "Disable"
+	if plan.Enable {
+		action = "Enable"
+	}
+
+	cmd.Printf(
+		"DRY RUN: %s Deployment %s/%s\n",
+		action,
+		plan.Namespace,
+		plan.Deployment,
+	)
+
+	cmd.Printf("Current replicas: %d\n", plan.CurrentReplicas)
+	cmd.Printf("Target replicas:  %d\n", plan.TargetReplicas)
+
+	if plan.SavedReplicas != nil {
+		cmd.Printf("Saved replicas:   %d\n", *plan.SavedReplicas)
+	} else {
+		cmd.Println("Saved replicas:   none")
+	}
+
+	if plan.Changes {
+		cmd.Println("A scaling operation would be performed.")
+	} else {
+		cmd.Println("No operation required; Deployment is already in the requested state.")
+	}
+
+	cmd.Println("No changes made to the cluster.")
 
 	return nil
 }

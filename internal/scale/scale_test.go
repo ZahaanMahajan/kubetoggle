@@ -1,8 +1,10 @@
 package scale
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -366,5 +368,266 @@ func TestOffAllowsDeploymentWhenHPATargetsAnotherDeployment(t *testing.T) {
 
 	if got := deployment.Annotations[PreviousReplicasAnnotation]; got != "2" {
 		t.Errorf("saved replicas = %q, want %q", got, "2")
+	}
+}
+
+func TestPreview(t *testing.T) {
+	int32Ptr := func(value int32) *int32 {
+		return &value
+	}
+
+	tests := []struct {
+		name        string
+		replicas    int32
+		annotations map[string]string
+		enable      bool
+		wantTarget  int32
+		wantSaved   *int32
+		wantChanges bool
+	}{
+		{
+			name:        "disable running Deployment",
+			replicas:    3,
+			enable:      false,
+			wantTarget:  0,
+			wantSaved:   int32Ptr(3),
+			wantChanges: true,
+		},
+		{
+			name:     "disable already disabled Deployment",
+			replicas: 0,
+			annotations: map[string]string{
+				PreviousReplicasAnnotation: "3",
+			},
+			enable:      false,
+			wantTarget:  0,
+			wantSaved:   int32Ptr(3),
+			wantChanges: false,
+		},
+		{
+			name:     "enable and restore saved replicas",
+			replicas: 0,
+			annotations: map[string]string{
+				PreviousReplicasAnnotation: "3",
+			},
+			enable:      true,
+			wantTarget:  3,
+			wantSaved:   int32Ptr(3),
+			wantChanges: true,
+		},
+		{
+			name:        "enable without saved replicas",
+			replicas:    0,
+			enable:      true,
+			wantTarget:  1,
+			wantChanges: true,
+		},
+		{
+			name:     "enable with invalid saved replicas",
+			replicas: 0,
+			annotations: map[string]string{
+				PreviousReplicasAnnotation: "invalid",
+			},
+			enable:      true,
+			wantTarget:  1,
+			wantChanges: true,
+		},
+		{
+			name:        "already enabled without saved state",
+			replicas:    2,
+			enable:      true,
+			wantTarget:  2,
+			wantChanges: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager, client := newTestManager(
+				t,
+				tt.replicas,
+				tt.annotations,
+			)
+
+			plan, err := manager.Preview(
+				context.Background(),
+				testNamespace,
+				testName,
+				tt.enable,
+			)
+			if err != nil {
+				t.Fatalf("Preview() error = %v", err)
+			}
+
+			if plan.TargetReplicas != tt.wantTarget {
+				t.Errorf(
+					"TargetReplicas = %d, want %d",
+					plan.TargetReplicas,
+					tt.wantTarget,
+				)
+			}
+
+			if plan.Changes != tt.wantChanges {
+				t.Errorf(
+					"Changes = %t, want %t",
+					plan.Changes,
+					tt.wantChanges,
+				)
+			}
+
+			if tt.wantSaved == nil {
+				if plan.SavedReplicas != nil {
+					t.Errorf(
+						"SavedReplicas = %d, want nil",
+						*plan.SavedReplicas,
+					)
+				}
+			} else {
+				if plan.SavedReplicas == nil {
+					t.Fatal("SavedReplicas = nil, want a value")
+				}
+
+				if *plan.SavedReplicas != *tt.wantSaved {
+					t.Errorf(
+						"SavedReplicas = %d, want %d",
+						*plan.SavedReplicas,
+						*tt.wantSaved,
+					)
+				}
+			}
+
+			assertNoWrites(t, client)
+		})
+	}
+}
+
+func TestPreviewRejectsDeploymentManagedByHPA(t *testing.T) {
+	manager, client := newTestManager(t, 2, nil)
+	createTestHPA(t, client, testName)
+
+	actionsBeforePreview := len(client.Actions())
+
+	_, err := manager.Preview(
+		context.Background(),
+		testNamespace,
+		testName,
+		false,
+	)
+	if err == nil {
+		t.Fatal("Preview() error = nil, want HPA protection error")
+	}
+
+	if !strings.Contains(err.Error(), "managed by HPA") {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	for _, action := range client.Actions()[actionsBeforePreview:] {
+		switch action.GetVerb() {
+		case "create", "update", "patch", "delete":
+			t.Errorf(
+				"unexpected Kubernetes write during Preview: verb=%s resource=%s",
+				action.GetVerb(),
+				action.GetResource().Resource,
+			)
+		}
+	}
+}
+
+// assertNoWrites verifies that an operation performed no Kubernetes writes.
+func assertNoWrites(t *testing.T, client *fake.Clientset) {
+	t.Helper()
+
+	for _, action := range client.Actions() {
+		switch action.GetVerb() {
+		case "create", "update", "patch", "delete":
+			t.Errorf(
+				"unexpected Kubernetes write action: verb=%s resource=%s subresource=%s",
+				action.GetVerb(),
+				action.GetResource().Resource,
+				action.GetSubresource(),
+			)
+		}
+	}
+}
+
+func captureLogs(t *testing.T, level slog.Level) *bytes.Buffer {
+	t.Helper()
+
+	var output bytes.Buffer
+
+	previousLogger := slog.Default()
+	logger := slog.New(slog.NewTextHandler(
+		&output,
+		&slog.HandlerOptions{Level: level},
+	))
+
+	slog.SetDefault(logger)
+
+	t.Cleanup(func() {
+		slog.SetDefault(previousLogger)
+	})
+
+	return &output
+}
+
+func TestOffLogsSuccessfulScaling(t *testing.T) {
+	logs := captureLogs(t, slog.LevelInfo)
+
+	manager, _ := newTestManager(t, 3, nil)
+
+	if err := manager.Off(context.Background(), testNamespace, testName); err != nil {
+		t.Fatalf("Off() error = %v", err)
+	}
+
+	output := logs.String()
+
+	expected := []string{
+		`msg="disable requested"`,
+		`namespace=portfolio`,
+		`deployment=portfolio`,
+		`msg="deployment scaled successfully"`,
+		`previous_replicas=3`,
+		`target_replicas=0`,
+	}
+
+	for _, value := range expected {
+		if !strings.Contains(output, value) {
+			t.Errorf("log output does not contain %q:\n%s", value, output)
+		}
+	}
+}
+
+func TestPreviewLogsDebugEvent(t *testing.T) {
+	logs := captureLogs(t, slog.LevelDebug)
+
+	manager, _ := newTestManager(t, 2, nil)
+
+	_, err := manager.Preview(
+		context.Background(),
+		testNamespace,
+		testName,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("Preview() error = %v", err)
+	}
+
+	output := logs.String()
+
+	expected := []string{
+		`level=DEBUG`,
+		`msg="scaling preview generated"`,
+		`operation=disable`,
+		`namespace=portfolio`,
+		`deployment=portfolio`,
+		`current_replicas=2`,
+		`target_replicas=0`,
+		`changes=true`,
+	}
+
+	for _, value := range expected {
+		if !strings.Contains(output, value) {
+			t.Errorf("log output does not contain %q:\n%s", value, output)
+		}
 	}
 }

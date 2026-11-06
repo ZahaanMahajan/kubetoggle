@@ -3,6 +3,7 @@ package scale
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 
 	"github.com/zahaanmahajan/kubetoggle/internal/safety"
@@ -21,13 +22,32 @@ type Manager struct {
 	client kubernetes.Interface
 }
 
+// Plan describes a scaling operation without modifying the cluster.
+type Plan struct {
+	Namespace       string
+	Deployment      string
+	Enable          bool
+	CurrentReplicas int32
+	TargetReplicas  int32
+	SavedReplicas   *int32
+	Changes         bool
+}
+
 func NewManager(client kubernetes.Interface) *Manager {
 	return &Manager{client: client}
 }
 
 // Off saves the current replica count and scales the Deployment to zero.
 func (m *Manager) Off(ctx context.Context, namespace, name string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	slog.InfoContext(ctx, "disable requested",
+		"namespace", namespace,
+		"deployment", name,
+	)
+
+	var previousReplicas int32
+	alreadyDisabled := false
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		deployment, err := m.getEligibleDeployment(ctx, namespace, name)
 		if err != nil {
 			return err
@@ -37,15 +57,18 @@ func (m *Manager) Off(ctx context.Context, namespace, name string) error {
 
 		// Already disabled: preserve the previously saved count.
 		if current == 0 {
+			alreadyDisabled = true
 			return nil
 		}
 
-		// Save the original replica count before scaling down.
+		previousReplicas = current
+
 		if deployment.Annotations == nil {
 			deployment.Annotations = make(map[string]string)
 		}
 
-		deployment.Annotations[PreviousReplicasAnnotation] = strconv.FormatInt(int64(current), 10)
+		deployment.Annotations[PreviousReplicasAnnotation] =
+			strconv.FormatInt(int64(current), 10)
 
 		_, err = m.client.AppsV1().Deployments(namespace).Update(
 			ctx,
@@ -58,24 +81,63 @@ func (m *Manager) Off(ctx context.Context, namespace, name string) error {
 
 		return m.updateScale(ctx, namespace, name, 0)
 	})
+
+	if err != nil {
+		slog.ErrorContext(ctx, "disable operation failed",
+			"namespace", namespace,
+			"deployment", name,
+			"error", err,
+		)
+		return err
+	}
+
+	if alreadyDisabled {
+		slog.InfoContext(ctx, "deployment already disabled",
+			"namespace", namespace,
+			"deployment", name,
+		)
+		return nil
+	}
+
+	slog.InfoContext(ctx, "deployment scaled successfully",
+		"namespace", namespace,
+		"deployment", name,
+		"previous_replicas", previousReplicas,
+		"target_replicas", 0,
+	)
+
+	return nil
 }
 
 // On restores the previous replica count and removes the saved annotation.
 func (m *Manager) On(ctx context.Context, namespace, name string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	slog.InfoContext(ctx, "enable requested",
+		"namespace", namespace,
+		"deployment", name,
+	)
+
+	var currentReplicas int32
+	var targetReplicas int32
+	alreadyEnabled := false
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		deployment, err := m.getEligibleDeployment(ctx, namespace, name)
 		if err != nil {
 			return err
 		}
 
 		current := replicaCount(deployment)
+		currentReplicas = current
 
 		// Already running and no saved state: nothing to do.
 		if current > 0 {
 			if deployment.Annotations == nil {
+				alreadyEnabled = true
 				return nil
 			}
+
 			if _, exists := deployment.Annotations[PreviousReplicasAnnotation]; !exists {
+				alreadyEnabled = true
 				return nil
 			}
 		}
@@ -90,6 +152,8 @@ func (m *Manager) On(ctx context.Context, namespace, name string) error {
 				}
 			}
 		}
+
+		targetReplicas = target
 
 		// Restore scale first. Keep the annotation if this operation fails.
 		if err := m.updateScale(ctx, namespace, name, target); err != nil {
@@ -127,6 +191,33 @@ func (m *Manager) On(ctx context.Context, namespace, name string) error {
 
 		return nil
 	})
+
+	if err != nil {
+		slog.ErrorContext(ctx, "enable operation failed",
+			"namespace", namespace,
+			"deployment", name,
+			"error", err,
+		)
+		return err
+	}
+
+	if alreadyEnabled {
+		slog.InfoContext(ctx, "deployment already enabled",
+			"namespace", namespace,
+			"deployment", name,
+			"replicas", currentReplicas,
+		)
+		return nil
+	}
+
+	slog.InfoContext(ctx, "deployment scaled successfully",
+		"namespace", namespace,
+		"deployment", name,
+		"previous_replicas", currentReplicas,
+		"target_replicas", targetReplicas,
+	)
+
+	return nil
 }
 
 func (m *Manager) getEligibleDeployment(
@@ -144,6 +235,12 @@ func (m *Manager) getEligibleDeployment(
 	}
 
 	if !safety.IsEligible(namespace, deployment.Labels) {
+		slog.WarnContext(ctx, "scaling operation rejected",
+			"reason", "deployment is not toggleable or namespace is protected",
+			"namespace", namespace,
+			"deployment", name,
+		)
+
 		return nil, fmt.Errorf(
 			"Deployment %s/%s is not eligible for kubetoggle",
 			namespace,
@@ -222,6 +319,13 @@ func (m *Manager) ensureNoHPA(
 
 		if target.Kind == "Deployment" &&
 			target.Name == deploymentName {
+			slog.WarnContext(ctx, "scaling operation rejected",
+				"reason", "deployment is managed by HPA",
+				"namespace", namespace,
+				"deployment", deploymentName,
+				"hpa", hpa.Name,
+			)
+
 			return fmt.Errorf(
 				"Deployment %s/%s is managed by HPA %s; refusing to scale",
 				namespace,
@@ -232,4 +336,87 @@ func (m *Manager) ensureNoHPA(
 	}
 
 	return nil
+}
+
+// Preview calculates a scaling operation without modifying Kubernetes resources.
+func (m *Manager) Preview(
+	ctx context.Context,
+	namespace string,
+	name string,
+	enable bool,
+) (*Plan, error) {
+	deployment, err := m.getEligibleDeployment(ctx, namespace, name)
+	if err != nil {
+		return nil, err
+	}
+
+	current := replicaCount(deployment)
+
+	plan := &Plan{
+		Namespace:       namespace,
+		Deployment:      name,
+		Enable:          enable,
+		CurrentReplicas: current,
+		TargetReplicas:  current,
+	}
+
+	savedValue, hasSavedValue := deployment.Annotations[PreviousReplicasAnnotation]
+
+	if !enable {
+		if current == 0 {
+			// Already disabled: preserve any previously saved replica count.
+			if hasSavedValue {
+				if parsed, err := strconv.ParseInt(savedValue, 10, 32); err == nil && parsed > 0 {
+					saved := int32(parsed)
+					plan.SavedReplicas = &saved
+				}
+			}
+			logPreview(ctx, plan)
+			return plan, nil
+		}
+
+		saved := current
+		plan.SavedReplicas = &saved
+		plan.TargetReplicas = 0
+		plan.Changes = true
+		logPreview(ctx, plan)
+		return plan, nil
+	}
+
+	if current > 0 && !hasSavedValue {
+		// Already enabled, with no saved state.
+		logPreview(ctx, plan)
+		return plan, nil
+	}
+
+	target := int32(1)
+
+	if hasSavedValue {
+		if parsed, err := strconv.ParseInt(savedValue, 10, 32); err == nil && parsed > 0 {
+			target = int32(parsed)
+			saved := target
+			plan.SavedReplicas = &saved
+		}
+	}
+
+	plan.TargetReplicas = target
+	plan.Changes = current != target || hasSavedValue
+	logPreview(ctx, plan)
+	return plan, nil
+}
+
+func logPreview(ctx context.Context, plan *Plan) {
+	operation := "disable"
+	if plan.Enable {
+		operation = "enable"
+	}
+
+	slog.DebugContext(ctx, "scaling preview generated",
+		"operation", operation,
+		"namespace", plan.Namespace,
+		"deployment", plan.Deployment,
+		"current_replicas", plan.CurrentReplicas,
+		"target_replicas", plan.TargetReplicas,
+		"changes", plan.Changes,
+	)
 }
