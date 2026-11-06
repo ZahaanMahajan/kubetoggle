@@ -8,6 +8,7 @@ import (
 
 	"github.com/zahaanmahajan/kubetoggle/internal/audit"
 	"github.com/zahaanmahajan/kubetoggle/internal/safety"
+	"github.com/zahaanmahajan/kubetoggle/internal/workload"
 
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -33,6 +34,7 @@ type Plan struct {
 	TargetReplicas  int32
 	SavedReplicas   *int32
 	Changes         bool
+	Resources       workload.Resources
 }
 
 func NewManager(
@@ -461,6 +463,7 @@ func (m *Manager) Preview(
 		Enable:          enable,
 		CurrentReplicas: current,
 		TargetReplicas:  current,
+		Resources:       workload.PodResources(deployment.Spec.Template.Spec),
 	}
 
 	savedValue, hasSavedValue := deployment.Annotations[PreviousReplicasAnnotation]

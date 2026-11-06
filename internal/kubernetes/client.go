@@ -8,11 +8,27 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-// NewClientset creates a Kubernetes client.
+// discardWarningHandler prevents Kubernetes API warnings from being
+// written to the terminal while the TUI is running.
+type discardWarningHandler struct{}
+
+func (discardWarningHandler) HandleWarningHeader(code int, agent, text string) {}
+
+// NewClientset creates a Kubernetes client with the default warning behavior.
 //
 // It first attempts to use in-cluster credentials.
 // If unavailable, it falls back to the user's kubeconfig.
 func NewClientset() (*k8sclient.Clientset, error) {
+	return newClientset(nil)
+}
+
+// NewTUIClientset creates a Kubernetes client that suppresses API warning
+// output to prevent interference with the Bubble Tea terminal interface.
+func NewTUIClientset() (*k8sclient.Clientset, error) {
+	return newClientset(discardWarningHandler{})
+}
+
+func newClientset(warningHandler rest.WarningHandler) (*k8sclient.Clientset, error) {
 	config, err := rest.InClusterConfig()
 
 	if err != nil {
@@ -30,6 +46,10 @@ func NewClientset() (*k8sclient.Clientset, error) {
 				err,
 			)
 		}
+	}
+
+	if warningHandler != nil {
+		config.WarningHandler = warningHandler
 	}
 
 	clientset, err := k8sclient.NewForConfig(config)

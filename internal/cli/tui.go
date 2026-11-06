@@ -16,8 +16,7 @@ func newTUICommand() *cobra.Command {
 		Use:   "tui",
 		Short: "Launch the interactive terminal interface",
 		RunE: func(cmd *cobra.Command, args []string) error {
-
-			client, err := kubernetes.NewClientset()
+			client, err := kubernetes.NewTUIClientset()
 			if err != nil {
 				return err
 			}
