@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zahaanmahajan/kubetoggle/internal/audit"
+
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -104,7 +106,7 @@ func newTestManager(t *testing.T, replicas int32, annotations map[string]string)
 		return true, scaleObject, nil
 	})
 
-	return NewManager(client), client
+	return NewManager(client, nil), client
 }
 
 func getTestDeployment(t *testing.T, client *fake.Clientset) *appsv1.Deployment {
@@ -629,5 +631,184 @@ func TestPreviewLogsDebugEvent(t *testing.T) {
 		if !strings.Contains(output, value) {
 			t.Errorf("log output does not contain %q:\n%s", value, output)
 		}
+	}
+}
+
+// fakeAuditRecorder captures audit events for testing.
+type fakeAuditRecorder struct {
+	events []audit.Event
+	err    error
+}
+
+func (f *fakeAuditRecorder) Record(event audit.Event) error {
+	f.events = append(f.events, event)
+	return f.err
+}
+
+func TestOffRecordsSuccessfulAuditEvent(t *testing.T) {
+	manager, _ := newTestManager(t, 3, nil)
+
+	recorder := &fakeAuditRecorder{}
+	manager.auditor = recorder
+
+	err := manager.Off(context.Background(), testNamespace, testName)
+	if err != nil {
+		t.Fatalf("Off() error = %v", err)
+	}
+
+	if len(recorder.events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(recorder.events))
+	}
+
+	event := recorder.events[0]
+
+	if event.Operation != "disable" {
+		t.Errorf("operation = %q, want disable", event.Operation)
+	}
+
+	if event.Result != "success" {
+		t.Errorf("result = %q, want success", event.Result)
+	}
+
+	if event.PreviousReplicas == nil || *event.PreviousReplicas != 3 {
+		t.Errorf("previous replicas = %v, want 3", event.PreviousReplicas)
+	}
+
+	if event.TargetReplicas == nil || *event.TargetReplicas != 0 {
+		t.Errorf("target replicas = %v, want 0", event.TargetReplicas)
+	}
+}
+
+func TestOnRecordsSuccessfulAuditEvent(t *testing.T) {
+	manager, _ := newTestManager(t, 0, map[string]string{
+		PreviousReplicasAnnotation: "3",
+	})
+
+	recorder := &fakeAuditRecorder{}
+	manager.auditor = recorder
+
+	err := manager.On(context.Background(), testNamespace, testName)
+	if err != nil {
+		t.Fatalf("On() error = %v", err)
+	}
+
+	if len(recorder.events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(recorder.events))
+	}
+
+	event := recorder.events[0]
+
+	if event.Operation != "enable" {
+		t.Errorf("operation = %q, want enable", event.Operation)
+	}
+
+	if event.Result != "success" {
+		t.Errorf("result = %q, want success", event.Result)
+	}
+
+	if event.PreviousReplicas == nil || *event.PreviousReplicas != 0 {
+		t.Errorf("previous replicas = %v, want 0", event.PreviousReplicas)
+	}
+
+	if event.TargetReplicas == nil || *event.TargetReplicas != 3 {
+		t.Errorf("target replicas = %v, want 3", event.TargetReplicas)
+	}
+}
+
+func TestOffRecordsNoopAuditEvent(t *testing.T) {
+	manager, _ := newTestManager(t, 0, map[string]string{
+		PreviousReplicasAnnotation: "3",
+	})
+
+	recorder := &fakeAuditRecorder{}
+	manager.auditor = recorder
+
+	err := manager.Off(context.Background(), testNamespace, testName)
+	if err != nil {
+		t.Fatalf("Off() error = %v", err)
+	}
+
+	if len(recorder.events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(recorder.events))
+	}
+
+	event := recorder.events[0]
+
+	if event.Result != "noop" {
+		t.Errorf("result = %q, want noop", event.Result)
+	}
+
+	if event.PreviousReplicas == nil || *event.PreviousReplicas != 0 {
+		t.Errorf("previous replicas = %v, want 0", event.PreviousReplicas)
+	}
+}
+
+func TestOffRecordsFailureAuditEvent(t *testing.T) {
+	manager, client := newTestManager(t, 3, nil)
+
+	recorder := &fakeAuditRecorder{}
+	manager.auditor = recorder
+
+	client.PrependReactor(
+		"update",
+		"deployments",
+		func(action k8stesting.Action) (bool, runtime.Object, error) {
+			if action.GetSubresource() == "scale" {
+				return true, nil, errors.New("simulated scale failure")
+			}
+
+			return false, nil, nil
+		},
+	)
+
+	err := manager.Off(context.Background(), testNamespace, testName)
+	if err == nil {
+		t.Fatal("Off() error = nil, want simulated scale failure")
+	}
+
+	if len(recorder.events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(recorder.events))
+	}
+
+	event := recorder.events[0]
+
+	if event.Result != "failure" {
+		t.Errorf("result = %q, want failure", event.Result)
+	}
+
+	if !strings.Contains(event.Error, "simulated scale failure") {
+		t.Errorf("audit error = %q, want simulated scale failure", event.Error)
+	}
+
+	if event.PreviousReplicas == nil || *event.PreviousReplicas != 3 {
+		t.Errorf("previous replicas = %v, want 3", event.PreviousReplicas)
+	}
+}
+
+func TestAuditWriteFailureDoesNotFailScaling(t *testing.T) {
+	manager, client := newTestManager(t, 3, nil)
+
+	recorder := &fakeAuditRecorder{
+		err: errors.New("simulated audit file failure"),
+	}
+	manager.auditor = recorder
+
+	err := manager.Off(context.Background(), testNamespace, testName)
+	if err != nil {
+		t.Fatalf("Off() returned error after audit failure: %v", err)
+	}
+
+	deployment := getTestDeployment(t, client)
+
+	if got := replicaCount(deployment); got != 0 {
+		t.Errorf("replicas = %d, want 0", got)
+	}
+
+	if len(recorder.events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(recorder.events))
+	}
+
+	if recorder.events[0].Result != "success" {
+		t.Errorf("audit result = %q, want success", recorder.events[0].Result)
 	}
 }

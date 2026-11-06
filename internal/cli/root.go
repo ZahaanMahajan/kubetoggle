@@ -3,6 +3,7 @@ package cli
 import (
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/zahaanmahajan/kubetoggle/internal/logging"
@@ -10,6 +11,7 @@ import (
 
 func NewRootCommand() *cobra.Command {
 	var logLevel string
+	var auditFile string
 
 	rootCmd := &cobra.Command{
 		Use:           "kubetoggle",
@@ -34,6 +36,13 @@ func NewRootCommand() *cobra.Command {
 		"log-level",
 		"warn",
 		"Logging level: debug, info, warn, error",
+	)
+
+	rootCmd.PersistentFlags().StringVar(
+		&auditFile,
+		"audit-file",
+		filepath.Join(os.Getenv("HOME"), ".local", "state", "kubetoggle", "audit.jsonl"),
+		"Path to the JSONL audit log",
 	)
 
 	rootCmd.AddCommand(

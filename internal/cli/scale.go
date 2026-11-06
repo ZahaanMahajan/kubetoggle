@@ -70,10 +70,12 @@ func runScaleCommand(
 		return err
 	}
 
-	manager := scale.NewManager(client)
 	ctx := cmd.Context()
 
+	// Dry-run must not initialize or write to the audit file.
 	if dryRun {
+		manager := scale.NewManager(client, nil)
+
 		plan, err := manager.Preview(ctx, namespace, name, enable)
 		if err != nil {
 			return err
@@ -88,6 +90,14 @@ func runScaleCommand(
 		return printPlan(cmd, plan)
 	}
 
+	recorder, err := newAuditRecorder(cmd)
+	if err != nil {
+		return err
+	}
+	defer recorder.Close()
+
+	manager := scale.NewManager(client, recorder)
+
 	if enable {
 		if err := manager.On(ctx, namespace, name); err != nil {
 			return fmt.Errorf("enable Deployment %s/%s: %w", namespace, name, err)
@@ -100,6 +110,7 @@ func runScaleCommand(
 	if err := warnAboutPVCs(cmd, client, namespace, name); err != nil {
 		return err
 	}
+
 	if err := manager.Off(ctx, namespace, name); err != nil {
 		return fmt.Errorf("disable Deployment %s/%s: %w", namespace, name, err)
 	}

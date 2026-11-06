@@ -16,10 +16,17 @@ func newTUICommand() *cobra.Command {
 		Use:   "tui",
 		Short: "Launch the interactive terminal interface",
 		RunE: func(cmd *cobra.Command, args []string) error {
+
 			client, err := kubernetes.NewClientset()
 			if err != nil {
 				return err
 			}
+
+			recorder, err := newAuditRecorder(cmd)
+			if err != nil {
+				return err
+			}
+			defer recorder.Close()
 
 			deployments, err := workload.Discover(cmd.Context(), client)
 			if err != nil {
@@ -27,7 +34,7 @@ func newTUICommand() *cobra.Command {
 			}
 
 			program := tea.NewProgram(
-				tui.NewModel(deployments, client),
+				tui.NewModel(deployments, client, recorder),
 				tea.WithAltScreen(),
 			)
 

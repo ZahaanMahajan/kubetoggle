@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zahaanmahajan/kubetoggle/internal/audit"
 	"github.com/zahaanmahajan/kubetoggle/internal/scale"
 	"github.com/zahaanmahajan/kubetoggle/internal/workload"
 
@@ -64,11 +65,12 @@ var (
 func NewModel(
 	deployments []workload.Deployment,
 	client k8sclient.Interface,
+	auditor audit.Sink,
 ) Model {
 	return Model{
 		deployments: deployments,
 		client:      client,
-		manager:     scale.NewManager(client),
+		manager:     scale.NewManager(client, auditor),
 	}
 }
 

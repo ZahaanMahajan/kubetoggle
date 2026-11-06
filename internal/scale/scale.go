@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strconv"
 
+	"github.com/zahaanmahajan/kubetoggle/internal/audit"
 	"github.com/zahaanmahajan/kubetoggle/internal/safety"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -19,7 +20,8 @@ import (
 const PreviousReplicasAnnotation = "kubetoggle.io/previous-replicas"
 
 type Manager struct {
-	client kubernetes.Interface
+	client  kubernetes.Interface
+	auditor audit.Sink
 }
 
 // Plan describes a scaling operation without modifying the cluster.
@@ -33,8 +35,14 @@ type Plan struct {
 	Changes         bool
 }
 
-func NewManager(client kubernetes.Interface) *Manager {
-	return &Manager{client: client}
+func NewManager(
+	client kubernetes.Interface,
+	auditor audit.Sink,
+) *Manager {
+	return &Manager{
+		client:  client,
+		auditor: auditor,
+	}
 }
 
 // Off saves the current replica count and scales the Deployment to zero.
@@ -45,6 +53,7 @@ func (m *Manager) Off(ctx context.Context, namespace, name string) error {
 	)
 
 	var previousReplicas int32
+	previousReplicasKnown := false
 	alreadyDisabled := false
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -54,14 +63,14 @@ func (m *Manager) Off(ctx context.Context, namespace, name string) error {
 		}
 
 		current := replicaCount(deployment)
+		previousReplicas = current
+		previousReplicasKnown = true
 
 		// Already disabled: preserve the previously saved count.
 		if current == 0 {
 			alreadyDisabled = true
 			return nil
 		}
-
-		previousReplicas = current
 
 		if deployment.Annotations == nil {
 			deployment.Annotations = make(map[string]string)
@@ -83,6 +92,22 @@ func (m *Manager) Off(ctx context.Context, namespace, name string) error {
 	})
 
 	if err != nil {
+		var previous *int32
+		if previousReplicasKnown {
+			previous = replicaPointer(previousReplicas)
+		}
+
+		m.recordAudit(
+			ctx,
+			"disable",
+			namespace,
+			name,
+			previous,
+			replicaPointer(0),
+			"failure",
+			err,
+		)
+
 		slog.ErrorContext(ctx, "disable operation failed",
 			"namespace", namespace,
 			"deployment", name,
@@ -92,12 +117,34 @@ func (m *Manager) Off(ctx context.Context, namespace, name string) error {
 	}
 
 	if alreadyDisabled {
+		m.recordAudit(
+			ctx,
+			"disable",
+			namespace,
+			name,
+			replicaPointer(previousReplicas),
+			replicaPointer(0),
+			"noop",
+			nil,
+		)
+
 		slog.InfoContext(ctx, "deployment already disabled",
 			"namespace", namespace,
 			"deployment", name,
 		)
 		return nil
 	}
+
+	m.recordAudit(
+		ctx,
+		"disable",
+		namespace,
+		name,
+		replicaPointer(previousReplicas),
+		replicaPointer(0),
+		"success",
+		nil,
+	)
 
 	slog.InfoContext(ctx, "deployment scaled successfully",
 		"namespace", namespace,
@@ -118,6 +165,10 @@ func (m *Manager) On(ctx context.Context, namespace, name string) error {
 
 	var currentReplicas int32
 	var targetReplicas int32
+
+	currentReplicasKnown := false
+	targetReplicasKnown := false
+
 	alreadyEnabled := false
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -128,16 +179,21 @@ func (m *Manager) On(ctx context.Context, namespace, name string) error {
 
 		current := replicaCount(deployment)
 		currentReplicas = current
+		currentReplicasKnown = true
 
 		// Already running and no saved state: nothing to do.
 		if current > 0 {
 			if deployment.Annotations == nil {
 				alreadyEnabled = true
+				targetReplicas = current
+				targetReplicasKnown = true
 				return nil
 			}
 
 			if _, exists := deployment.Annotations[PreviousReplicasAnnotation]; !exists {
 				alreadyEnabled = true
+				targetReplicas = current
+				targetReplicasKnown = true
 				return nil
 			}
 		}
@@ -154,6 +210,7 @@ func (m *Manager) On(ctx context.Context, namespace, name string) error {
 		}
 
 		targetReplicas = target
+		targetReplicasKnown = true
 
 		// Restore scale first. Keep the annotation if this operation fails.
 		if err := m.updateScale(ctx, namespace, name, target); err != nil {
@@ -193,6 +250,28 @@ func (m *Manager) On(ctx context.Context, namespace, name string) error {
 	})
 
 	if err != nil {
+		var previous *int32
+		var target *int32
+
+		if currentReplicasKnown {
+			previous = replicaPointer(currentReplicas)
+		}
+
+		if targetReplicasKnown {
+			target = replicaPointer(targetReplicas)
+		}
+
+		m.recordAudit(
+			ctx,
+			"enable",
+			namespace,
+			name,
+			previous,
+			target,
+			"failure",
+			err,
+		)
+
 		slog.ErrorContext(ctx, "enable operation failed",
 			"namespace", namespace,
 			"deployment", name,
@@ -202,6 +281,17 @@ func (m *Manager) On(ctx context.Context, namespace, name string) error {
 	}
 
 	if alreadyEnabled {
+		m.recordAudit(
+			ctx,
+			"enable",
+			namespace,
+			name,
+			replicaPointer(currentReplicas),
+			replicaPointer(targetReplicas),
+			"noop",
+			nil,
+		)
+
 		slog.InfoContext(ctx, "deployment already enabled",
 			"namespace", namespace,
 			"deployment", name,
@@ -209,6 +299,17 @@ func (m *Manager) On(ctx context.Context, namespace, name string) error {
 		)
 		return nil
 	}
+
+	m.recordAudit(
+		ctx,
+		"enable",
+		namespace,
+		name,
+		replicaPointer(currentReplicas),
+		replicaPointer(targetReplicas),
+		"success",
+		nil,
+	)
 
 	slog.InfoContext(ctx, "deployment scaled successfully",
 		"namespace", namespace,
@@ -220,6 +321,7 @@ func (m *Manager) On(ctx context.Context, namespace, name string) error {
 	return nil
 }
 
+// getEligibleDeployment retrieves a Deployment and validates its eligibility.
 func (m *Manager) getEligibleDeployment(
 	ctx context.Context,
 	namespace string,
@@ -255,6 +357,7 @@ func (m *Manager) getEligibleDeployment(
 	return deployment, nil
 }
 
+// updateScale modifies the Deployment's scale subresource.
 func (m *Manager) updateScale(
 	ctx context.Context,
 	namespace string,
@@ -419,4 +522,46 @@ func logPreview(ctx context.Context, plan *Plan) {
 		"target_replicas", plan.TargetReplicas,
 		"changes", plan.Changes,
 	)
+}
+
+// recordAudit writes an audit event without changing the scaling operation result.
+func (m *Manager) recordAudit(
+	ctx context.Context,
+	operation string,
+	namespace string,
+	deployment string,
+	previousReplicas *int32,
+	targetReplicas *int32,
+	result string,
+	operationErr error,
+) {
+	if m.auditor == nil {
+		return
+	}
+
+	event := audit.Event{
+		Operation:        operation,
+		Namespace:        namespace,
+		Deployment:       deployment,
+		PreviousReplicas: previousReplicas,
+		TargetReplicas:   targetReplicas,
+		Result:           result,
+	}
+
+	if operationErr != nil {
+		event.Error = operationErr.Error()
+	}
+
+	if err := m.auditor.Record(event); err != nil {
+		slog.WarnContext(ctx, "audit record write failed",
+			"operation", operation,
+			"namespace", namespace,
+			"deployment", deployment,
+			"audit_error", err,
+		)
+	}
+}
+
+func replicaPointer(value int32) *int32 {
+	return &value
 }
