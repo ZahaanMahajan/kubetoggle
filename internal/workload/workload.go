@@ -11,6 +11,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	k8sclient "k8s.io/client-go/kubernetes"
 )
 
@@ -28,13 +29,36 @@ type Resources struct {
 	MemoryLimitBytes   int64
 }
 
+// Usage represents actual CPU and memory consumption reported
+// by the Kubernetes Metrics API.
+type Usage struct {
+	CPUUsageMilli    int64
+	MemoryUsageBytes int64
+}
+
 type Deployment struct {
+	UID         types.UID
 	Namespace   string
 	Name        string
 	Application string
 	Replicas    int32
 	PVCs        []string
 	Resources   Resources
+}
+
+// ResourceSummary aggregates the resource reservations of toggleable Deployments.
+type ResourceSummary struct {
+	TotalWorkloads   int
+	RunningWorkloads int
+	StoppedWorkloads int
+	RunningReplicas  int64
+
+	// Resources currently reserved by running toggleable Deployments.
+	RunningResources Resources
+
+	// Resources that could potentially be released by disabling all
+	// currently running toggleable Deployments.
+	RecoverableResources Resources
 }
 
 // Discover lists Deployments explicitly opted in to kubetoggle.
@@ -63,6 +87,7 @@ func Discover(
 		}
 
 		result = append(result, Deployment{
+			UID:         deployment.UID,
 			Namespace:   deployment.Namespace,
 			Name:        deployment.Name,
 			Application: applicationName(&deployment),
@@ -258,4 +283,45 @@ func PVCNames(deployment *appsv1.Deployment) []string {
 
 	sort.Strings(names)
 	return names
+}
+
+// Summarize aggregates workload counts and resource reservations.
+//
+// Resource values are calculated by multiplying each Deployment's
+// per-Pod resources by its current replica count.
+func Summarize(deployments []Deployment) ResourceSummary {
+	summary := ResourceSummary{
+		TotalWorkloads: len(deployments),
+	}
+
+	for _, deployment := range deployments {
+		if deployment.Replicas <= 0 {
+			summary.StoppedWorkloads++
+			continue
+		}
+
+		summary.RunningWorkloads++
+		summary.RunningReplicas += int64(deployment.Replicas)
+
+		replicas := int64(deployment.Replicas)
+		resources := deployment.Resources
+
+		summary.RunningResources.CPURequestMilli +=
+			resources.CPURequestMilli * replicas
+
+		summary.RunningResources.MemoryRequestBytes +=
+			resources.MemoryRequestBytes * replicas
+
+		summary.RunningResources.CPULimitMilli +=
+			resources.CPULimitMilli * replicas
+
+		summary.RunningResources.MemoryLimitBytes +=
+			resources.MemoryLimitBytes * replicas
+	}
+
+	// Disabling every currently running toggleable Deployment could
+	// release its current resource reservations.
+	summary.RecoverableResources = summary.RunningResources
+
+	return summary
 }

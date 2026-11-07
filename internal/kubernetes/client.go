@@ -6,6 +6,7 @@ import (
 	k8sclient "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	metricsclient "k8s.io/metrics/pkg/client/clientset/versioned"
 )
 
 // discardWarningHandler prevents Kubernetes API warnings from being
@@ -15,20 +16,67 @@ type discardWarningHandler struct{}
 func (discardWarningHandler) HandleWarningHeader(code int, agent, text string) {}
 
 // NewClientset creates a Kubernetes client with the default warning behavior.
-//
-// It first attempts to use in-cluster credentials.
-// If unavailable, it falls back to the user's kubeconfig.
 func NewClientset() (*k8sclient.Clientset, error) {
-	return newClientset(nil)
+	config, err := newRESTConfig(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	clientset, err := k8sclient.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Kubernetes client: %w", err)
+	}
+
+	return clientset, nil
 }
 
-// NewTUIClientset creates a Kubernetes client that suppresses API warning
-// output to prevent interference with the Bubble Tea terminal interface.
+// NewTUIClientset creates a Kubernetes client that suppresses API warnings.
 func NewTUIClientset() (*k8sclient.Clientset, error) {
-	return newClientset(discardWarningHandler{})
+	config, err := newRESTConfig(discardWarningHandler{})
+	if err != nil {
+		return nil, err
+	}
+
+	clientset, err := k8sclient.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Kubernetes client: %w", err)
+	}
+
+	return clientset, nil
 }
 
-func newClientset(warningHandler rest.WarningHandler) (*k8sclient.Clientset, error) {
+// NewMetricsClient creates a client for the Kubernetes Metrics API.
+func NewMetricsClient() (*metricsclient.Clientset, error) {
+	config, err := newRESTConfig(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	clientset, err := metricsclient.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Metrics API client: %w", err)
+	}
+
+	return clientset, nil
+}
+
+// NewTUIMetricsClient creates a Metrics API client that suppresses warnings.
+func NewTUIMetricsClient() (*metricsclient.Clientset, error) {
+	config, err := newRESTConfig(discardWarningHandler{})
+	if err != nil {
+		return nil, err
+	}
+
+	clientset, err := metricsclient.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Metrics API client: %w", err)
+	}
+
+	return clientset, nil
+}
+
+// newRESTConfig loads in-cluster credentials or falls back to kubeconfig.
+func newRESTConfig(warningHandler rest.WarningHandler) (*rest.Config, error) {
 	config, err := rest.InClusterConfig()
 
 	if err != nil {
@@ -52,10 +100,5 @@ func newClientset(warningHandler rest.WarningHandler) (*k8sclient.Clientset, err
 		config.WarningHandler = warningHandler
 	}
 
-	clientset, err := k8sclient.NewForConfig(config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Kubernetes client: %w", err)
-	}
-
-	return clientset, nil
+	return config, nil
 }

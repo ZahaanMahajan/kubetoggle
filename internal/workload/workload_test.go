@@ -203,3 +203,79 @@ func TestPVCNames(t *testing.T) {
 		t.Fatalf("pvcNames() = %v, want %v", got, expected)
 	}
 }
+
+func TestSummarize(t *testing.T) {
+	deployments := []Deployment{
+		{
+			Name:     "strapi",
+			Replicas: 2,
+			Resources: Resources{
+				CPURequestMilli:    500,
+				MemoryRequestBytes: 512 * 1024 * 1024,
+				CPULimitMilli:      1000,
+				MemoryLimitBytes:   1024 * 1024 * 1024,
+			},
+		},
+		{
+			Name:     "linkding",
+			Replicas: 1,
+			Resources: Resources{
+				CPURequestMilli:    250,
+				MemoryRequestBytes: 256 * 1024 * 1024,
+				CPULimitMilli:      500,
+				MemoryLimitBytes:   512 * 1024 * 1024,
+			},
+		},
+		{
+			Name:     "nextcloud",
+			Replicas: 0,
+			Resources: Resources{
+				CPURequestMilli:    1000,
+				MemoryRequestBytes: 1024 * 1024 * 1024,
+				CPULimitMilli:      2000,
+				MemoryLimitBytes:   2 * 1024 * 1024 * 1024,
+			},
+		},
+	}
+
+	got := Summarize(deployments)
+
+	if got.TotalWorkloads != 3 {
+		t.Errorf("TotalWorkloads = %d, want 3", got.TotalWorkloads)
+	}
+
+	if got.RunningWorkloads != 2 {
+		t.Errorf("RunningWorkloads = %d, want 2", got.RunningWorkloads)
+	}
+
+	if got.StoppedWorkloads != 1 {
+		t.Errorf("StoppedWorkloads = %d, want 1", got.StoppedWorkloads)
+	}
+
+	if got.RunningReplicas != 3 {
+		t.Errorf("RunningReplicas = %d, want 3", got.RunningReplicas)
+	}
+
+	expected := Resources{
+		CPURequestMilli:    1250,
+		MemoryRequestBytes: 1280 * 1024 * 1024,
+		CPULimitMilli:      2500,
+		MemoryLimitBytes:   2560 * 1024 * 1024,
+	}
+
+	if got.RunningResources != expected {
+		t.Errorf("RunningResources = %+v, want %+v", got.RunningResources, expected)
+	}
+
+	if got.RecoverableResources != expected {
+		t.Errorf("RecoverableResources = %+v, want %+v", got.RecoverableResources, expected)
+	}
+}
+
+func TestSummarizeEmpty(t *testing.T) {
+	got := Summarize(nil)
+
+	if got != (ResourceSummary{}) {
+		t.Errorf("Summarize(nil) = %+v, want zero-value summary", got)
+	}
+}

@@ -321,9 +321,14 @@ func (m Model) View() string {
 	}
 
 	header := m.renderHeader(width)
+	overview := m.renderResourceOverview(width)
 	footer := m.renderFooter(width)
 
-	bodyHeight := height - lipgloss.Height(header) - lipgloss.Height(footer) - 2
+	bodyHeight := height -
+		lipgloss.Height(header) -
+		lipgloss.Height(overview) -
+		lipgloss.Height(footer) - 3
+
 	if bodyHeight < 8 {
 		bodyHeight = 8
 	}
@@ -331,7 +336,7 @@ func (m Model) View() string {
 	var body string
 
 	if width >= 100 {
-		leftWidth := width * 55 / 100
+		leftWidth := width * 45 / 100
 		rightWidth := width - leftWidth - 1
 
 		left := m.renderWorkloadPanel(leftWidth, bodyHeight)
@@ -356,6 +361,7 @@ func (m Model) View() string {
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		header,
+		overview,
 		body,
 		footer,
 	)
@@ -400,6 +406,73 @@ func (m Model) renderHeader(width int) string {
 		stats,
 		"",
 	)
+}
+
+func (m Model) renderResourceOverview(width int) string {
+	summary := workload.Summarize(m.deployments)
+
+	var b strings.Builder
+
+	b.WriteString(panelTitleStyle.Render(
+		"RESOURCE OVERVIEW · TOGGLEABLE WORKLOADS",
+	))
+	b.WriteString("\n")
+
+	fmt.Fprintf(
+		&b,
+		"%s  %d    %s  %d    %s  %d    %s  %d\n",
+		mutedStyle.Render("Total:"),
+		summary.TotalWorkloads,
+		onStyle.Render("Running:"),
+		summary.RunningWorkloads,
+		offStyle.Render("Stopped:"),
+		summary.StoppedWorkloads,
+		mutedStyle.Render("Replicas:"),
+		summary.RunningReplicas,
+	)
+
+	current := summary.RunningResources
+	recoverable := summary.RecoverableResources
+
+	b.WriteString("\n")
+	b.WriteString(panelTitleStyle.Render("CURRENT RESERVATIONS"))
+	b.WriteString("\n")
+
+	fmt.Fprintf(
+		&b,
+		"CPU requests: %s  ·  CPU limits: %s\n",
+		formatCPU(current.CPURequestMilli),
+		formatCPU(current.CPULimitMilli),
+	)
+
+	fmt.Fprintf(
+		&b,
+		"Memory requests: %s  ·  Memory limits: %s\n",
+		formatMemory(current.MemoryRequestBytes),
+		formatMemory(current.MemoryLimitBytes),
+	)
+
+	b.WriteString("\n")
+	b.WriteString(panelTitleStyle.Render("POTENTIALLY RECOVERABLE"))
+	b.WriteString("\n")
+
+	fmt.Fprintf(
+		&b,
+		"CPU requests: %s  ·  CPU limits: %s\n",
+		formatCPU(recoverable.CPURequestMilli),
+		formatCPU(recoverable.CPULimitMilli),
+	)
+
+	fmt.Fprintf(
+		&b,
+		"Memory requests: %s  ·  Memory limits: %s",
+		formatMemory(recoverable.MemoryRequestBytes),
+		formatMemory(recoverable.MemoryLimitBytes),
+	)
+
+	return panelStyle.
+		Width(max(1, width-2)).
+		Render(b.String())
 }
 
 func (m Model) renderWorkloadPanel(width, height int) string {
@@ -513,78 +586,118 @@ func (m Model) renderDetailsPanel(width, height int) string {
 		return m.renderConfirmationPanel(width, height)
 	}
 
-	var b strings.Builder
+	var left, right strings.Builder
 
-	b.WriteString(panelTitleStyle.Render("DEPLOYMENT DETAILS"))
-	b.WriteString("\n\n")
+	left.WriteString(panelTitleStyle.Render("DEPLOYMENT DETAILS"))
+	left.WriteString("\n\n")
 
 	if len(m.deployments) == 0 {
-		b.WriteString(mutedStyle.Render("Select a workload to inspect."))
+		left.WriteString(mutedStyle.Render("Select a workload to inspect."))
+
+		return panelStyle.
+			Width(max(1, width-2)).
+			Height(max(1, height-2)).
+			Render(left.String())
+	}
+
+	deployment := m.deployments[m.cursor]
+
+	state := offStyle.Render("● OFFLINE")
+	if deployment.Replicas > 0 {
+		state = onStyle.Render("● RUNNING")
+	}
+
+	left.WriteString(headerStyle.Render(deployment.Name))
+	left.WriteString("\n")
+	left.WriteString(state)
+	left.WriteString("\n\n")
+
+	m.renderDetailRow(&left, "APPLICATION", deployment.Application)
+	m.renderDetailRow(&left, "NAMESPACE", deployment.Namespace)
+	m.renderDetailRow(
+		&left,
+		"DESIRED REPLICAS",
+		fmt.Sprintf("%d", deployment.Replicas),
+	)
+
+	left.WriteString(panelTitleStyle.Render("PERSISTENT STORAGE"))
+	left.WriteString("\n")
+
+	if len(deployment.PVCs) == 0 {
+		left.WriteString(mutedStyle.Render("No PVCs referenced"))
+		left.WriteString("\n")
 	} else {
-		deployment := m.deployments[m.cursor]
-
-		state := offStyle.Render("● OFFLINE")
-		if deployment.Replicas > 0 {
-			state = onStyle.Render("● RUNNING")
+		for _, claim := range deployment.PVCs {
+			fmt.Fprintf(&left, "◇ %s\n", valueStyle.Render(claim))
 		}
+	}
 
-		b.WriteString(headerStyle.Render(deployment.Name))
-		b.WriteString("\n")
-		b.WriteString(state)
-		b.WriteString("\n\n")
+	left.WriteString("\n")
+	left.WriteString(panelTitleStyle.Render("AVAILABLE ACTION"))
+	left.WriteString("\n")
 
-		m.renderDetailRow(&b, "APPLICATION", deployment.Application)
-		m.renderDetailRow(&b, "NAMESPACE", deployment.Namespace)
-		m.renderDetailRow(
-			&b,
-			"DESIRED REPLICAS",
-			fmt.Sprintf("%d", deployment.Replicas),
-		)
+	if deployment.Replicas == 0 {
+		left.WriteString(" ")
+		left.WriteString(keyStyle.Render("[SPACE]"))
+		left.WriteString(" Restore workload\n")
+	} else {
+		left.WriteString(" ")
+		left.WriteString(keyStyle.Render("[SPACE]"))
+		left.WriteString(" Disable workload\n")
+	}
 
-		b.WriteString("\n")
-		b.WriteString(panelTitleStyle.Render("PERSISTENT STORAGE"))
-		b.WriteString("\n")
+	right.WriteString(panelTitleStyle.Render("RESOURCE RESERVATIONS"))
+	right.WriteString("\n\n")
 
-		if len(deployment.PVCs) == 0 {
-			b.WriteString(mutedStyle.Render("No PVCs referenced"))
-		} else {
-			for _, claim := range deployment.PVCs {
-				b.WriteString("  ◇ ")
-				b.WriteString(valueStyle.Render(claim))
-				b.WriteString("\n")
-			}
-		}
+	current := deployment.Resources
+	replicas := int64(deployment.Replicas)
 
-		b.WriteString("\n")
-		b.WriteString(panelTitleStyle.Render("AVAILABLE ACTION"))
-		b.WriteString("\n")
+	current.CPURequestMilli *= replicas
+	current.MemoryRequestBytes *= replicas
+	current.CPULimitMilli *= replicas
+	current.MemoryLimitBytes *= replicas
 
-		if deployment.Replicas == 0 {
-			b.WriteString("  ")
-			b.WriteString(keyStyle.Render("[SPACE]"))
-			b.WriteString(" Restore workload\n")
-		} else {
-			b.WriteString("  ")
-			b.WriteString(keyStyle.Render("[SPACE]"))
-			b.WriteString(" Disable workload\n")
-		}
+	right.WriteString(panelTitleStyle.Render("CURRENT"))
+	right.WriteString("\n")
 
-		m.renderResourceImpact(&b, deployment)
+	right.WriteString(renderResourceValues(current))
+
+	if plan := m.lastImpact; plan != nil &&
+		plan.Namespace == deployment.Namespace &&
+		plan.Deployment == deployment.Name {
+
+		right.WriteString("\n")
+		right.WriteString(panelTitleStyle.Render("LAST OPERATION"))
+		right.WriteString("\n")
+
+		right.WriteString(m.renderResourceDelta(plan))
 	}
 
 	if m.busy {
-		b.WriteString("\n")
-		b.WriteString(warningStyle.Render("◌ Working..."))
+		right.WriteString("\n")
+		right.WriteString(warningStyle.Render("◌ Working..."))
 	}
 
 	if m.message != "" {
-		b.WriteString("\n\n")
-		b.WriteString(m.message)
+		right.WriteString("\n\n")
+		right.WriteString(m.message)
 	}
 
-	return panelStyle.Width(max(1, width-2)).
+	contentWidth := max(1, width-8)
+	leftWidth := max(1, contentWidth*42/100)
+	rightWidth := max(1, contentWidth-leftWidth-2)
+
+	content := lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		lipgloss.NewStyle().Width(leftWidth).Render(left.String()),
+		"  ",
+		lipgloss.NewStyle().Width(rightWidth).Render(right.String()),
+	)
+
+	return panelStyle.
+		Width(max(1, width-2)).
 		Height(max(1, height-2)).
-		Render(b.String())
+		Render(content)
 }
 
 func (m Model) renderConfirmationPanel(width, height int) string {
@@ -602,85 +715,153 @@ func (m Model) renderConfirmationPanel(width, height int) string {
 		Bold(true).
 		Foreground(actionColor)
 
-	var b strings.Builder
+	var left, right strings.Builder
 
-	b.WriteString(panelTitleStyle.Render("CONFIRM ACTION"))
-	b.WriteString("\n\n")
+	left.WriteString(panelTitleStyle.Render("CONFIRM ACTION"))
+	left.WriteString("\n\n")
 
-	b.WriteString(actionStyle.Render("◆ " + action + " WORKLOAD"))
-	b.WriteString("\n\n")
+	left.WriteString(actionStyle.Render("◆ " + action + " WORKLOAD"))
+	left.WriteString("\n\n")
 
-	b.WriteString(headerStyle.Render(deployment.Name))
-	b.WriteString("\n")
-	b.WriteString(mutedStyle.Render(deployment.Namespace))
-	b.WriteString("\n\n")
+	left.WriteString(headerStyle.Render(deployment.Name))
+	left.WriteString("\n")
+	left.WriteString(mutedStyle.Render(deployment.Namespace))
+	left.WriteString("\n\n")
+
+	fmt.Fprintf(
+		&left,
+		"%s %d → %d\n\n",
+		mutedStyle.Render("Replicas:"),
+		deployment.Replicas,
+		func() int32 {
+			if deployment.Replicas == 0 {
+				return 1
+			}
+			return 0
+		}(),
+	)
 
 	if deployment.Replicas > 0 && len(deployment.PVCs) > 0 {
-		b.WriteString(warningStyle.Render("⚠ PERSISTENT STORAGE WARNING"))
-		b.WriteString("\n")
-		b.WriteString("Scaling to zero stops its Pods.\nPVCs and PVs will not be deleted.\n\n")
+		left.WriteString(warningStyle.Render("⚠ PERSISTENT STORAGE WARNING"))
+		left.WriteString("\n")
+		left.WriteString("Scaling to zero stops its Pods.\n")
+		left.WriteString("PVCs and PVs will not be deleted.\n\n")
 	}
 
-	b.WriteString(panelTitleStyle.Render("RESOURCE IMPACT PREVIEW"))
-	b.WriteString("\n")
-
-	if m.previewBusy {
-		b.WriteString(warningStyle.Render("◌ Calculating resource impact..."))
-		b.WriteString("\n")
-	} else if m.preview != nil {
-		plan := m.preview
-
-		fmt.Fprintf(
-			&b,
-			"%s\n",
-			mutedStyle.Render(
-				fmt.Sprintf("Replicas: %d → %d", plan.CurrentReplicas, plan.TargetReplicas),
-			),
-		)
-
-		delta := int64(plan.TargetReplicas) - int64(plan.CurrentReplicas)
-		actionLabel := "RESOURCES RELEASED"
-		actionColor := colorRed
-
-		if delta > 0 {
-			actionLabel = "RESOURCES REQUESTED"
-			actionColor = colorGreen
-		}
-
-		b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(actionColor).Render(actionLabel))
-		b.WriteString("\n\n")
-
-		resources := plan.Resources
-
-		fmt.Fprintf(&b, "  CPU request     %s\n", formatCPU(absInt64(resources.CPURequestMilli*delta)))
-		fmt.Fprintf(&b, "  Memory request  %s\n", formatMemory(absInt64(resources.MemoryRequestBytes*delta)))
-		fmt.Fprintf(&b, "  CPU limit       %s\n", formatCPU(absInt64(resources.CPULimitMilli*delta)))
-		fmt.Fprintf(&b, "  Memory limit    %s\n", formatMemory(absInt64(resources.MemoryLimitBytes*delta)))
-
-		if delta == 0 {
-			b.WriteString(mutedStyle.Render("No replica change; no resource reservation change."))
-			b.WriteString("\n")
-		}
-	} else {
-		b.WriteString(errorStyle.Render("Resource preview unavailable."))
-		b.WriteString("\n")
-	}
-
-	b.WriteString("\n")
-	b.WriteString("Are you sure you want to continue?\n\n")
+	left.WriteString("Are you sure you want to continue?\n\n")
 
 	if m.previewBusy || m.preview == nil {
-		b.WriteString(mutedStyle.Render("Waiting for preview before confirmation..."))
+		left.WriteString(mutedStyle.Render("Waiting for resource preview..."))
 	} else {
-		b.WriteString(keyStyle.Render("[Y]"))
-		b.WriteString(" Confirm    ")
-		b.WriteString(keyStyle.Render("[N]"))
-		b.WriteString(" Cancel")
+		left.WriteString(keyStyle.Render("[Y]"))
+		left.WriteString(" Confirm    ")
+		left.WriteString(keyStyle.Render("[N]"))
+		left.WriteString(" Cancel")
 	}
 
-	return confirmationStyle.Width(max(1, width-8)).
+	right.WriteString(panelTitleStyle.Render("RESOURCE IMPACT PREVIEW"))
+	right.WriteString("\n\n")
+
+	if m.previewBusy {
+		right.WriteString(warningStyle.Render("◌ Calculating resource impact..."))
+	} else if m.preview != nil {
+		right.WriteString(m.renderResourceDelta(m.preview))
+	} else {
+		right.WriteString(errorStyle.Render("Resource preview unavailable."))
+	}
+
+	contentWidth := max(1, width-16)
+	leftWidth := max(1, contentWidth*42/100)
+	rightWidth := max(1, contentWidth-leftWidth-2)
+
+	content := lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		lipgloss.NewStyle().Width(leftWidth).Render(left.String()),
+		"  ",
+		lipgloss.NewStyle().Width(rightWidth).Render(right.String()),
+	)
+
+	return confirmationStyle.
+		Width(max(1, width-8)).
 		Height(max(1, height-4)).
-		Render(b.String())
+		Render(content)
+}
+
+func renderResourceValues(resources workload.Resources) string {
+	var b strings.Builder
+
+	fmt.Fprintf(
+		&b,
+		"CPU request     %s\n",
+		formatCPU(resources.CPURequestMilli),
+	)
+
+	fmt.Fprintf(
+		&b,
+		"Memory request  %s\n",
+		formatMemory(resources.MemoryRequestBytes),
+	)
+
+	fmt.Fprintf(
+		&b,
+		"CPU limit       %s\n",
+		formatCPU(resources.CPULimitMilli),
+	)
+
+	fmt.Fprintf(
+		&b,
+		"Memory limit    %s\n",
+		formatMemory(resources.MemoryLimitBytes),
+	)
+
+	return b.String()
+}
+
+func (m Model) renderResourceDelta(plan *scale.Plan) string {
+	var b strings.Builder
+
+	delta := int64(plan.TargetReplicas) - int64(plan.CurrentReplicas)
+
+	fmt.Fprintf(
+		&b,
+		"%s\n\n",
+		mutedStyle.Render(
+			fmt.Sprintf(
+				"Replicas: %d → %d",
+				plan.CurrentReplicas,
+				plan.TargetReplicas,
+			),
+		),
+	)
+
+	if delta == 0 {
+		b.WriteString(mutedStyle.Render("No resource reservation change.\n"))
+		return b.String()
+	}
+
+	action := "RESOURCES RELEASED"
+	actionStyle := offStyle
+
+	if delta > 0 {
+		action = "RESOURCES REQUESTED"
+		actionStyle = onStyle
+	}
+
+	b.WriteString(actionStyle.Render(action))
+	b.WriteString("\n\n")
+
+	resources := plan.Resources
+
+	impact := workload.Resources{
+		CPURequestMilli:    absInt64(resources.CPURequestMilli * delta),
+		MemoryRequestBytes: absInt64(resources.MemoryRequestBytes * delta),
+		CPULimitMilli:      absInt64(resources.CPULimitMilli * delta),
+		MemoryLimitBytes:   absInt64(resources.MemoryLimitBytes * delta),
+	}
+
+	b.WriteString(renderResourceValues(impact))
+
+	return b.String()
 }
 
 func (m Model) renderDetailRow(b *strings.Builder, label, value string) {
